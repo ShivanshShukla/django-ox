@@ -2,5 +2,7 @@
 
 {% block object-tools-items %}
   {{ block.super }}
-  <li><a href="{% url 'admin:django_ox_oxtask_overview' %}">Queue overview</a></li>
+  {# This template also serves a project's own ModelAdmin for OxTask, which has no overview URL. #}
+  {% url 'admin:django_ox_oxtask_overview' as overview_url %}
+  {% if overview_url %}<li><a href="{{ overview_url }}">Queue overview</a></li>{% endif %}
 {% endblock %}

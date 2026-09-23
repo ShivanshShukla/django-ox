@@ -223,6 +223,33 @@ class TestQueueOverview:
 
 
 @pytest.mark.django_db
+class TestOtherAdminSites:
+    @pytest.fixture(autouse=True)
+    def _sites(self, settings):
+        settings.ROOT_URLCONF = "tests.urls_admin_sites"
+
+    def test_a_plain_model_admin_change_list_still_renders(self, admin_client):
+        response = admin_client.get("/plain/django_ox/oxtask/")
+        assert response.status_code == 200
+        assert "overview/" not in response.content.decode()
+
+    def test_links_stay_on_the_site_that_serves_the_page(self, admin_client):
+        OxTask.objects.create(
+            task_path="tests.tasks.add",
+            backend_name="default",
+            queue_name="default",
+            status=OxTask.Status.READY,
+            enqueued_at=timezone.now(),
+        )
+        change_list = admin_client.get("/ops/django_ox/oxtask/").content.decode()
+        assert 'href="/ops/django_ox/oxtask/overview/"' in change_list
+
+        overview = admin_client.get("/ops/django_ox/oxtask/overview/").content.decode()
+        assert 'href="/ops/django_ox/oxtask/?queue_name=default' in overview
+        assert "/admin/" not in overview
+
+
+@pytest.mark.django_db
 class TestActions:
     def test_retry_selected_reports_counts(self, admin_client, worker):
         failed = failed_task(worker)
