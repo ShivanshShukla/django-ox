@@ -505,20 +505,23 @@ action does not accept.
 
 The admin does not add, edit or delete rows. A hand-edited status would
 bypass the lease, and a delete could take a row from under a running
-worker; `ox_prune` is the way rows leave the table. The actions need the
-`change_oxtask` permission; viewing needs `view_oxtask`.
+worker; `ox_prune` is the way rows leave the table. The actions need
+`change_oxtask`; viewing accepts either `view_oxtask` or `change_oxtask`.
 
-The change list's **Queue overview** link opens a read-only comparison table.
-It has one row for every queue with retained task rows, showing each status,
-READY tasks eligible now, the oldest eligible age, throughput per minute,
-failure rate, and the age of the last claim. READY includes deferred tasks;
-Eligible ready does not. Throughput and failure rate cover the trailing five
-minutes, and both are shown as a dash when no task finished in that window.
-The status totals are retained rows, not lifetime counts. Last claim age is
-claim activity, not a heartbeat or proof that a worker is alive.
+Open **Queue overview** from the task change list. It shows one row per
+queue with retained task rows: status counts, eligible READY tasks, the
+oldest eligible task's age, throughput per minute, failure rate, and time
+since the last claim.
 
-The page has no automatic refresh. Each visit makes five grouped queries that
-scan retained task rows, so its cost grows with retention. It reads the alias
-`OxTask` writes to. A worker explicitly started with `ox_worker --database
-other` can work a different alias; the overview does not follow that flag
-unless the router also sends `OxTask` writes to `other`.
+READY includes deferred tasks; Eligible ready excludes them. Throughput and
+failure rate cover the trailing five minutes. Both display a dash when no
+task finished in that window. Status totals count retained rows, not
+lifetime activity. An absent oldest eligible age displays a dash; no
+recorded claim displays `never`. Last claim age is not a heartbeat or proof
+that a worker is alive.
+
+Each visit scans retained task rows, so cost grows with retention. The page
+does not refresh automatically. It uses the database alias selected by
+`router.db_for_write(OxTask)`, not the worker's `--database` flag. To show
+rows processed by `ox_worker --database other`, that router selection must
+also resolve to `other`.

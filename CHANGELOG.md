@@ -12,7 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The task admin has a **Queue overview** page linked from its change list.
   It compares retained rows by queue without adding aggregation queries to
   ordinary change-list visits. The page shows status counts, eligible backlog
-  and age, five-minute throughput and failure rate, and claim activity.
+  and age, five-minute throughput and failure rate, and time since the last
+  claim.
 
 ## [1.4.0] - 2026-09-23
 
@@ -1323,6 +1324,7 @@ Initial release.
   the public API surface, the pre-1.0 SemVer rule, the deprecation
   window, and the supported Python and Django matrix.
 
+[Unreleased]: https://github.com/oxpull/django-ox/compare/v1.4.0...HEAD
 [1.4.0]: https://github.com/oxpull/django-ox/compare/v1.3.1...v1.4.0
 [1.3.1]: https://github.com/oxpull/django-ox/compare/v1.3.0...v1.3.1
 [1.3.0]: https://github.com/oxpull/django-ox/compare/v1.2.0...v1.3.0
