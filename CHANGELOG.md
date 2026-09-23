@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- The task admin has a **Queue overview** page linked from its change list.
+  It compares retained rows by queue without adding aggregation queries to
+  ordinary change-list visits. The page shows status counts, eligible backlog
+  and age, five-minute throughput and failure rate, and claim activity.
+
 ## [1.4.0] - 2026-09-23
 
 If you use Django's PostgreSQL pool, check PostgreSQL `max_connections`

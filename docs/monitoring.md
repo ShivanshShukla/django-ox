@@ -507,3 +507,18 @@ The admin does not add, edit or delete rows. A hand-edited status would
 bypass the lease, and a delete could take a row from under a running
 worker; `ox_prune` is the way rows leave the table. The actions need the
 `change_oxtask` permission; viewing needs `view_oxtask`.
+
+The change list's **Queue overview** link opens a read-only comparison table.
+It has one row for every queue with retained task rows, showing each status,
+READY tasks eligible now, the oldest eligible age, throughput per minute,
+failure rate, and the age of the last claim. READY includes deferred tasks;
+Eligible ready does not. Throughput and failure rate cover the trailing five
+minutes, and both are shown as a dash when no task finished in that window.
+The status totals are retained rows, not lifetime counts. Last claim age is
+claim activity, not a heartbeat or proof that a worker is alive.
+
+The page has no automatic refresh. Each visit makes five grouped queries that
+scan retained task rows, so its cost grows with retention. It reads the alias
+`OxTask` writes to. A worker explicitly started with `ox_worker --database
+other` can work a different alias; the overview does not follow that flag
+unless the router also sends `OxTask` writes to `other`.

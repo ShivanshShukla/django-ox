@@ -3,8 +3,13 @@ The admin registration: opt-in through django.contrib.admin's autodiscover,
 read-only, with the two actions wired to django_ox.actions.
 """
 
+from datetime import timedelta
+
 import pytest
 from django.contrib.auth.models import Permission, User
+from django.db import connection
+from django.test import Client, RequestFactory
+from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
 from django.utils import timezone
 
@@ -32,6 +37,7 @@ def failed_task(worker):
 
 
 CHANGELIST = "admin:django_ox_oxtask_changelist"
+OVERVIEW = "admin:django_ox_oxtask_overview"
 
 
 @pytest.mark.django_db
@@ -79,6 +85,141 @@ class TestChangelist:
     def test_add_and_delete_are_off(self, admin_client):
         response = admin_client.get(reverse("admin:django_ox_oxtask_add"))
         assert response.status_code == 403
+
+    def test_queue_overview_link_is_in_the_change_list(self, admin_client):
+        response = admin_client.get(reverse(CHANGELIST))
+        assert response.status_code == 200
+        assert f'href="{reverse(OVERVIEW)}"' in response.content.decode()
+
+
+@pytest.mark.django_db
+class TestQueueOverview:
+    def _task(self, **over):
+        fields = {
+            "task_path": "tests.tasks.add",
+            "backend_name": "default",
+            "queue_name": "default",
+            "status": OxTask.Status.READY,
+            "enqueued_at": timezone.now(),
+        }
+        fields.update(over)
+        return OxTask.objects.create(**fields)
+
+    def test_direct_url_is_not_an_object_id_redirect(self, admin_client):
+        response = admin_client.get(reverse(OVERVIEW), follow=False)
+        assert response.status_code == 200
+        assert response.request["PATH_INFO"] == reverse(OVERVIEW)
+
+    def test_permissions_and_safe_methods(self, client):
+        url = reverse(OVERVIEW)
+        assert client.get(url).status_code == 302
+
+        non_staff = User.objects.create_user("member", password="pw")
+        client.force_login(non_staff)
+        assert client.get(url).status_code == 302
+
+        staff = User.objects.create_user("staff", password="pw", is_staff=True)
+        client.force_login(staff)
+        assert client.get(url).status_code == 403
+
+        viewer = User.objects.create_user("viewer", password="pw", is_staff=True)
+        viewer.user_permissions.add(Permission.objects.get(codename="view_oxtask"))
+        client.force_login(viewer)
+        assert client.get(url).status_code == 200
+        assert client.head(url).status_code == 200
+
+        changer = User.objects.create_user("changer", password="pw", is_staff=True)
+        changer.user_permissions.add(Permission.objects.get(codename="change_oxtask"))
+        client.force_login(changer)
+        assert client.get(url).status_code == 200
+
+        superuser = User.objects.create_superuser("root", "root@example.com", "pw")
+        client.force_login(superuser)
+        assert client.get(url).status_code == 200
+
+        csrf_client = Client(enforce_csrf_checks=True)
+        csrf_client.force_login(superuser)
+        csrf_client.cookies["csrftoken"] = "a" * 32
+        assert csrf_client.post(url, HTTP_X_CSRFTOKEN="a" * 32).status_code == 405
+
+    def test_rows_metrics_empty_window_and_escaping(self, admin_client):
+        now = timezone.now()
+        queue = "ops&<critical>"
+        self._task(queue_name=queue, status=OxTask.Status.READY)
+        self._task(
+            queue_name=queue,
+            status=OxTask.Status.READY,
+            run_after=now + timedelta(hours=1),
+        )
+        for status in (
+            OxTask.Status.RUNNING,
+            OxTask.Status.WAITING,
+            OxTask.Status.FAILED,
+            OxTask.Status.SUCCESSFUL,
+            OxTask.Status.LOST,
+            OxTask.Status.DISCARDED,
+        ):
+            self._task(queue_name=queue, status=status)
+
+        body = admin_client.get(reverse(OVERVIEW)).content.decode()
+        assert "Queue overview" in body
+        assert "ops&amp;&lt;critical&gt;" in body
+        assert "ops&<critical>" not in body
+        assert "Eligible ready" in body
+        assert ">2</a>" in body  # Ready includes the deferred task.
+        assert ">1</td>" in body  # Eligible ready does not.
+        assert "status__exact=WAITING" in body
+        assert "queue_name=ops%26%3Ccritical%3E" in body
+        assert "—" in body  # No finished task is inside the five-minute window.
+        assert "never" in body
+
+    def test_empty_database_is_a_successful_empty_page(self, admin_client):
+        response = admin_client.get(reverse(OVERVIEW))
+        assert response.status_code == 200
+        assert "No queues have task rows." in response.content.decode()
+
+    def test_collects_five_queries_for_any_number_of_queues(self):
+        from django.contrib.admin.sites import AdminSite
+
+        from django_ox.admin import OxTaskAdmin
+
+        class Operator:
+            is_active = True
+            is_staff = True
+            is_superuser = True
+
+            def has_perm(self, _permission):
+                return True
+
+            def has_module_perms(self, _app_label):
+                return True
+
+        view = OxTaskAdmin(OxTask, AdminSite()).get_urls()[0].callback
+        for queues in (8, 16):
+            OxTask.objects.all().delete()
+            OxTask.objects.bulk_create(
+                [
+                    OxTask(
+                        task_path="tests.tasks.add",
+                        backend_name="default",
+                        queue_name=f"queue-{number:02}",
+                        status=OxTask.Status.READY,
+                        enqueued_at=timezone.now(),
+                    )
+                    for number in range(queues)
+                ]
+            )
+            request = RequestFactory().get("/admin/django_ox/oxtask/overview/")
+            request.user = Operator()
+            with CaptureQueriesContext(connection) as queries:
+                response = view(request)
+                response.render()
+            task_queries = [
+                query
+                for query in queries.captured_queries
+                if OxTask._meta.db_table in query["sql"]
+            ]
+            assert len(task_queries) == 5
 
 
 @pytest.mark.django_db

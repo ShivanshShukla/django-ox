@@ -368,6 +368,7 @@ SCHEDULE_CHANGE = "admin:django_ox_oxschedule_change"
 SCHEDULE_HISTORY = "admin:django_ox_oxschedule_history"
 SCHEDULE_DELETE = "admin:django_ox_oxschedule_delete"
 TASKS = "admin:django_ox_oxtask_changelist"
+TASK_OVERVIEW = "admin:django_ox_oxtask_overview"
 TASK_CHANGE = "admin:django_ox_oxtask_change"
 TASK_HISTORY = "admin:django_ox_oxtask_history"
 AUTOCOMPLETE = "admin:autocomplete"
@@ -1125,6 +1126,15 @@ class TestTheAdminOverHttp:
         assert detail.status_code == 200
         assert OxTask.objects.using(REPLICA).count() == 0
 
+    def test_the_task_overview_reads_the_rows_the_workers_have(self, armed, operator):
+        snapshot_to_replica()
+        a_task(queue_name="primary-only")
+        with armed():
+            page = operator.get(reverse(TASK_OVERVIEW))
+        assert page.status_code == 200
+        assert "primary-only" in page.content.decode()
+        assert OxTask.objects.using(REPLICA).count() == 0
+
     def test_a_task_action_posted_from_the_changelist(self, armed, operator):
         snapshot_to_replica()
         failed = a_task(status=OxTask.Status.FAILED, finished_at=timezone.now())
@@ -1509,6 +1519,8 @@ class TestTheInventory:
         failed = a_task(status=OxTask.Status.FAILED, finished_at=timezone.now())
         with armed("admin task changelist"):
             assert client.get(reverse(TASKS)).status_code == 200
+        with armed("admin task queue overview"):
+            assert client.get(reverse(TASK_OVERVIEW)).status_code == 200
         with armed("admin task changelist, filtered, searched, by date"):
             filters = {
                 "status__exact": OxTask.Status.FAILED,

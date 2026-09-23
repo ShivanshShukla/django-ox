@@ -236,6 +236,32 @@ class TestUnderAReplicaThatIsBehind:
             response = views.metrics(RequestFactory().get("/metrics"))
         assert 'django_ox_ready_tasks{queue="default"} 40' in response.content.decode()
 
+    def test_the_admin_overview_reads_the_primary(self):
+        from django.contrib.admin.sites import AdminSite
+        from django.test import RequestFactory
+
+        from django_ox.admin import OxTaskAdmin
+
+        class Operator:
+            is_active = True
+            is_staff = True
+            is_superuser = True
+
+            def has_perm(self, _permission):
+                return True
+
+            def has_module_perms(self, _app_label):
+                return True
+
+        self._backlog()
+        request = RequestFactory().get("/admin/django_ox/oxtask/overview/")
+        request.user = Operator()
+        view = OxTaskAdmin(OxTask, AdminSite()).get_urls()[0].callback
+        with no_statement_on(REPLICA):
+            response = view(request)
+            response.render()
+        assert "Queue overview" in response.content.decode()
+
     def test_the_shipped_view_can_be_mounted_on_another_alias(self):
         """
         A project that served scrapes off a replica before this release has
