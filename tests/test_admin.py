@@ -289,17 +289,17 @@ class TestQueueOverview:
         assert row["oldest"] == "—"
         assert row["claim"] == "never"
 
-    def test_ages_carry_units(self, admin_client):
+    def test_ages_carry_units(self, admin_client, monkeypatch):
         now = timezone.now()
+        monkeypatch.setattr(timezone, "now", lambda: now)
         self._task(enqueued_at=now - timedelta(seconds=3725))
         self._task(
             status=OxTask.Status.RUNNING, last_attempted_at=now - timedelta(seconds=90)
         )
         self._task(queue_name="skewed", enqueued_at=now + timedelta(minutes=5))
         rows = overview_rows(admin_client.get(reverse(OVERVIEW)).content.decode())
-        # Ranges rather than exact values, so a slow run cannot cross a unit.
-        assert re.fullmatch(r"1h 2m [0-5]?\ds", rows["default"]["oldest"])
-        assert re.fullmatch(r"1m [3-5]\ds", rows["default"]["claim"])
+        assert rows["default"]["oldest"] == "1h 2m 5s"
+        assert rows["default"]["claim"] == "1m 30s"
         assert rows["skewed"]["oldest"] == "0s"
 
     def test_a_missing_status_sample_reads_zero(self, admin_client, monkeypatch):
