@@ -183,17 +183,6 @@ class OxTaskAdmin(_ModelAdmin):
     def has_add_permission(self, request: HttpRequest) -> bool:
         return False
 
-    def has_view_permission(
-        self, request: HttpRequest, obj: OxTask | None = None
-    ) -> bool:
-        # The task detail deliberately has no change form, so
-        # has_change_permission() is false even for somebody holding the
-        # model's change permission. Django normally treats that permission
-        # as permission to view; retain that rule for this read-only admin.
-        return super().has_view_permission(request, obj) or request.user.has_perm(
-            f"{self.opts.app_label}.change_{self.opts.model_name}"
-        )
-
     def has_change_permission(
         self, request: HttpRequest, obj: OxTask | None = None
     ) -> bool:
