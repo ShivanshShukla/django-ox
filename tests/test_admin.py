@@ -3,7 +3,11 @@ The admin registration: opt-in through django.contrib.admin's autodiscover,
 read-only, with the two actions wired to django_ox.actions.
 """
 
+import re
+from dataclasses import replace
 from datetime import timedelta
+from html import unescape
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from django.contrib.auth.models import Permission, User
@@ -13,7 +17,7 @@ from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
 from django.utils import timezone
 
-from django_ox import _waiting
+from django_ox import _waiting, metrics
 from django_ox.models import OxTask
 
 from .tasks import STATE, add, echo, fail_always
@@ -38,6 +42,38 @@ def failed_task(worker):
 
 CHANGELIST = "admin:django_ox_oxtask_changelist"
 OVERVIEW = "admin:django_ox_oxtask_overview"
+OVERVIEW_COLUMNS = (
+    "ready",
+    "eligible",
+    "running",
+    "waiting",
+    "failed",
+    "successful",
+    "lost",
+    "discarded",
+    "oldest",
+    "throughput",
+    "failure",
+    "claim",
+)
+
+
+def overview_rows(body):
+    """Each queue's cells from the overview table, keyed by column."""
+    rows = {}
+    for row in re.findall(r'<tr>\s*<th scope="row">(.*?)</tr>', body, re.S):
+        name, rest = row.split("</th>", 1)
+        cells = re.findall(r"<td>(.*?)</td>", rest, re.S)
+        rows[unescape(name)] = dict(zip(OVERVIEW_COLUMNS, cells, strict=True))
+    return rows
+
+
+def status_link(cell):
+    """The change-list path, query and count of one linked status cell."""
+    match = re.fullmatch(r'<a href="([^"]*)">([^<]*)</a>', cell)
+    assert match, cell
+    url = urlsplit(unescape(match.group(1)))
+    return url.path, parse_qs(url.query), match.group(2)
 
 
 @pytest.mark.django_db
@@ -172,6 +208,138 @@ class TestQueueOverview:
         assert "queue_name=ops%26%3Ccritical%3E" in body
         assert "—" in body  # No finished task is inside the five-minute window.
         assert "never" in body
+
+    def test_another_django_ox_permission_is_not_enough(self, client):
+        staff = User.objects.create_user("scheduler", password="pw", is_staff=True)
+        staff.user_permissions.add(Permission.objects.get(codename="view_oxschedule"))
+        client.force_login(staff)
+        assert client.get(reverse(OVERVIEW)).status_code == 403
+
+    def test_only_a_permitted_visit_runs_the_aggregate_queries(
+        self, client, monkeypatch
+    ):
+        calls = []
+        real_collect = metrics.collect
+        monkeypatch.setattr(
+            metrics, "collect", lambda **kw: calls.append(kw) or real_collect(**kw)
+        )
+        url = reverse(OVERVIEW)
+        client.get(url)
+        staff = User.objects.create_user("staff", password="pw", is_staff=True)
+        client.force_login(staff)
+        assert client.get(url).status_code == 403
+        superuser = User.objects.create_superuser("root", "root@example.com", "pw")
+        client.force_login(superuser)
+        assert client.get(reverse(CHANGELIST)).status_code == 200
+        assert calls == []
+
+        assert client.get(url).status_code == 200
+        assert len(calls) == 1
+
+    def test_each_status_links_its_own_count_and_exact_filter(self, admin_client):
+        queue = "ops&<x>"
+        counts = {
+            "READY": 1,
+            "RUNNING": 2,
+            "WAITING": 3,
+            "FAILED": 4,
+            "SUCCESSFUL": 5,
+            "LOST": 6,
+            "DISCARDED": 7,
+        }
+        for status, count in counts.items():
+            for _ in range(count):
+                self._task(queue_name=queue, status=status)
+        self._task(queue_name=queue, run_after=timezone.now() + timedelta(hours=1))
+        counts["READY"] += 1
+
+        body = admin_client.get(reverse(OVERVIEW)).content.decode()
+        row = overview_rows(body)[queue]
+        for status, count in counts.items():
+            path, query, text = status_link(row[status.lower()])
+            assert path == reverse(CHANGELIST)
+            assert query == {"queue_name": [queue], "status__exact": [status]}
+            assert text == str(count)
+        assert row["eligible"] == "1"
+        assert "No queues have task rows." not in body
+
+    def test_rows_are_ordered_by_queue_name(self, admin_client):
+        for name in ("bravo", "alpha", "charlie"):
+            self._task(queue_name=name)
+        self._task(queue_name="done", status=OxTask.Status.SUCCESSFUL)
+        body = admin_client.get(reverse(OVERVIEW)).content.decode()
+        assert list(overview_rows(body)) == ["alpha", "bravo", "charlie", "done"]
+
+    def test_finished_window_readings(self, admin_client):
+        now = timezone.now()
+        for _ in range(3):
+            self._task(status=OxTask.Status.SUCCESSFUL, finished_at=now)
+        self._task(status=OxTask.Status.FAILED, finished_at=now)
+        body = admin_client.get(reverse(OVERVIEW)).content.decode()
+        row = overview_rows(body)["default"]
+        assert row["throughput"] == "0.80"
+        assert row["failure"] == "25.00%"
+
+    def test_an_empty_window_dashes_both_readings(self, admin_client):
+        self._task(status=OxTask.Status.RUNNING)
+        body = admin_client.get(reverse(OVERVIEW)).content.decode()
+        row = overview_rows(body)["default"]
+        assert row["throughput"] == "—"
+        assert row["failure"] == "—"
+        assert row["oldest"] == "—"
+        assert row["claim"] == "never"
+
+    def test_ages_carry_units(self, admin_client):
+        now = timezone.now()
+        self._task(enqueued_at=now - timedelta(seconds=3725))
+        self._task(
+            status=OxTask.Status.RUNNING, last_attempted_at=now - timedelta(seconds=90)
+        )
+        self._task(queue_name="skewed", enqueued_at=now + timedelta(minutes=5))
+        rows = overview_rows(admin_client.get(reverse(OVERVIEW)).content.decode())
+        # Ranges rather than exact values, so a slow run cannot cross a unit.
+        assert re.fullmatch(r"1h 2m [0-5]?\ds", rows["default"]["oldest"])
+        assert re.fullmatch(r"1m [3-5]\ds", rows["default"]["claim"])
+        assert rows["skewed"]["oldest"] == "0s"
+
+    def test_a_missing_status_sample_reads_zero(self, admin_client, monkeypatch):
+        self._task()
+        real_collect = metrics.collect
+
+        def without_waiting(**kw):
+            return [
+                replace(
+                    family,
+                    samples=tuple(
+                        sample
+                        for sample in family.samples
+                        if sample[0].get("status") != "waiting"
+                    ),
+                )
+                for family in real_collect(**kw)
+            ]
+
+        monkeypatch.setattr(metrics, "collect", without_waiting)
+        response = admin_client.get(reverse(OVERVIEW))
+        assert response.status_code == 200
+        row = overview_rows(response.content.decode())["default"]
+        assert status_link(row["waiting"])[2] == "0"
+
+    def test_admin_chrome_notes_and_no_controls(self, admin_client):
+        self._task()
+        response = admin_client.get(reverse(OVERVIEW))
+        body = response.content.decode()
+        assert "no-cache" in response["Cache-Control"]
+        assert '<div id="user-tools">' in body
+        assert "<title>Queue overview |" in body
+        assert len(re.findall(r"<h1[^>]*>Queue overview</h1>", body)) == 1
+        assert f'<a href="{reverse(CHANGELIST)}">' in body  # breadcrumb
+        assert "As of " in body
+        assert "trailing five minutes" in body
+        assert "Ready includes deferred" in body
+        content = body[body.index('<div id="content-main">') :].lower()
+        for control in ("<form", "<script", "<button", "http-equiv"):
+            assert control not in content
 
     def test_empty_database_is_a_successful_empty_page(self, admin_client):
         response = admin_client.get(reverse(OVERVIEW))
