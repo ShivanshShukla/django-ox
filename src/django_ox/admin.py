@@ -14,6 +14,10 @@ get_queryset methods below say so. A ModelAdmin builds its queryset from the
 default manager, which follows db_for_read. Under a router that sends reads
 to a replica these pages would answer from a database no worker writes, and
 the change form submits what it rendered.
+
+The queue overview is a separate page linked from the task list. It calls
+metrics.collect() once per visit, on the same alias; the change list itself
+runs none of those aggregate queries.
 """
 
 from __future__ import annotations
@@ -225,9 +229,7 @@ class OxTaskAdmin(_ModelAdmin):
         }
         statuses: dict[str, dict[str, int]] = {}
         for labels, value in families["django_ox_tasks"]:
-            statuses.setdefault(labels["queue"], {})[labels["status"].lower()] = int(
-                value
-            )
+            statuses.setdefault(labels["queue"], {})[labels["status"]] = int(value)
 
         def by_queue(name: str) -> dict[str, float]:
             return {labels["queue"]: value for labels, value in families[name]}
