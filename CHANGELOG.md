@@ -9,7 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Documented the `worker_class` structured log key on
+  `claim_filter_sql_missing` and added a source-to-documentation test for
+  structured-log extra keys.
 - `ox_import_beat_schedules` preserves supported `start_time` and `expires` bounds when importing schedules from `django-celery-beat`. It lists one-off rows, expired rows, and expiries at or before a future start under `# Not translated, and why:`, interprets naive cursor values using `connection.timezone` when `USE_TZ=True`, and warns about expiry before application in the footer.
+
+### Added
+
+- The task admin has a **Queue overview** page linked from its change list.
+  It compares retained rows by queue without adding aggregation queries to
+  ordinary change-list visits. The page shows status counts, eligible backlog
+  and age, five-minute throughput and failure rate, and time since the last
+  claim.
+- `ox_worker --batch` exits once a poll pass finds nothing to claim and none
+  of its own tasks is running, and `--max-tasks N` exits after N claimed attempts, for
+  cron and job runners. Both drain and exit 0, log `worker_batch_empty` or
+  `worker_max_tasks_reached` with the `claimed` count, and are rejected with
+  `--processes` above 1. `Worker` takes matching `batch` and `max_tasks`
+  keyword arguments, passed by the command only when the flag is given, so
+  existing fixed-signature `WORKER_CLASS` constructors keep working when
+  neither new flag is supplied.
 
 ## [1.4.0] - 2026-09-23
 
@@ -1320,6 +1339,7 @@ Initial release.
   the public API surface, the pre-1.0 SemVer rule, the deprecation
   window, and the supported Python and Django matrix.
 
+[Unreleased]: https://github.com/oxpull/django-ox/compare/v1.4.0...HEAD
 [1.4.0]: https://github.com/oxpull/django-ox/compare/v1.3.1...v1.4.0
 [1.3.1]: https://github.com/oxpull/django-ox/compare/v1.3.0...v1.3.1
 [1.3.0]: https://github.com/oxpull/django-ox/compare/v1.2.0...v1.3.0

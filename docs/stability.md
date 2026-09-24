@@ -21,6 +21,10 @@ export names this page does not list; those names are not public.
 - **The management commands** and their flags: `ox_worker`, `ox_prune`,
   `ox_health`. `ox_worker`'s exit codes: 0 after a drain, 130 on a forced
   exit, 75 when the worker recycles itself after a stuck task thread.
+  A worker that finishes under `--batch` or `--max-tasks` drains and exits
+  0, even when attempts failed; each outcome stays on its task row. An
+  invalid `--max-tasks`, or either flag with `--processes` above 1, exits 1
+  before any worker starts.
   Under `--processes`, the supervisor exits 0 when every worker drained
   or recycled, 1 when a slot hit the restart cap, and otherwise with the
   first other non-zero worker code. A worker killed by a signal reports

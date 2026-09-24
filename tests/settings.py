@@ -103,6 +103,13 @@ if "OX_TEST_LOG_FILE" in os.environ:
     }
     LOGGING["loggers"]["django_ox"]["handlers"].append("file")
 
+# A worker process started from the test suite writes bare messages. A test
+# that times the worker from a record, rather than from when it got round to
+# reading the line, asks for a format that carries the record's timestamp.
+if "OX_TEST_LOG_FORMAT" in os.environ:
+    LOGGING["formatters"] = {"test": {"format": os.environ["OX_TEST_LOG_FORMAT"]}}
+    LOGGING["handlers"]["console"]["formatter"] = "test"
+
 # Worker processes started from the test suite must hit the test database the
 # parent created, not the development one; the parent passes its name through.
 if "OX_TEST_DB_NAME" in os.environ:

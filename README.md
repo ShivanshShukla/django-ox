@@ -50,7 +50,7 @@ Execution is at-least-once: make tasks safe to repeat.
 
 Enqueue inside `transaction.atomic()` on the database holding `OxTask`, and the task commits or rolls back with your application data. No `transaction.on_commit()` needed.
 
-Inspect attempts in Django admin, then retry or discard tasks there. Edit recurring schedules in admin or declare them in settings; workers dispatch them without a scheduler process.
+Inspect attempts and retry or discard tasks in Django admin. Open **Queue overview** from the task change list to compare queues. Edit recurring schedules in admin or declare them in settings; workers dispatch them without a scheduler process.
 
 For deployment probes, `ox_health` turns queue thresholds into an exit code, with `--format json` for structured output. Monitor through `django_ox.stats` or `/ox/metrics`, and clear finished rows with `ox_prune`. Use `--database` on `ox_worker`, `ox_prune` and `ox_health` to select the database alias.
 
@@ -170,6 +170,8 @@ python manage.py ox_worker
 | `--interval` | `1.0` | Polling interval in seconds when idle. |
 | `--lock-timeout` | backend `LOCK_TIMEOUT` | Seconds a RUNNING task's lock may go unrefreshed before the task is reclaimed. |
 | `--database` | the alias `OxTask` writes to | Database alias to run against. Every `--processes` child is given the same one. It is not checked against the router. |
+| `--batch` | off | Exit once a poll pass finds nothing to claim and none of its own tasks is running. For cron and job runners. Single process only. |
+| `--max-tasks N` | none | Exit after claiming N task attempts, failed attempts and retries included. Single process only. |
 
 On SIGTERM or SIGINT the worker stops claiming, finishes in-flight tasks, then
 exits. A second signal forces an immediate exit. With `--processes` above 1,
@@ -226,13 +228,25 @@ Mounting `path("ox/", include("django_ox.urls"))` exposes `GET /ox/metrics`,
 the same numbers as Prometheus gauges; the view has no authentication of its
 own.
 
-When `django.contrib.admin` is installed, the task table is registered with
-it: a filterable list, a read-only detail page with every attempt's
-traceback, and **Retry selected tasks** and **Discard selected tasks**
-actions. The same two operations are `django_ox.actions.retry(result_id)`
-and `django_ox.actions.discard(result_id)`. A retry is one more attempt on
-a FAILED or LOST task; a discard closes a READY, WAITING, FAILED or LOST task
+When `django.contrib.admin` is installed, django-ox registers a filterable
+task list and a read-only detail page with every attempt's traceback. The
+list provides **Retry selected tasks** and **Discard selected tasks**
+actions. The same operations are `django_ox.actions.retry(result_id)` and
+`django_ox.actions.discard(result_id)`. A retry is one more attempt on a
+FAILED or LOST task; a discard closes a READY, WAITING, FAILED or LOST task
 without running it. Neither touches a running task.
+
+Open **Queue overview** from the task change list to compare retained status
+counts, eligible READY tasks, the oldest eligible task's age, five-minute
+throughput and failure rate, and time since the last claim. READY includes
+deferred tasks; Eligible ready excludes them. Status totals are retained
+rows, not lifetime counts.
+
+Each visit scans retained task rows, so cost grows with retention. The page
+does not refresh automatically. It uses the database alias selected by
+`router.db_for_write(OxTask)`. To show rows processed by
+`ox_worker --database other`, that router selection must also resolve to
+`other`.
 
 Worker lifecycle events (claim, start, success, retry, failure, reclaim,
 shutdown) log to the `django_ox` logger with stable extra keys (task id,

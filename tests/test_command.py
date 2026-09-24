@@ -35,6 +35,38 @@ class StoppedWorker(Worker):
         StoppedWorker.started = True
 
 
+class FixedSignatureWorker(Worker):
+    """A WORKER_CLASS written before --batch and --max-tasks existed."""
+
+    started = False
+
+    def __init__(
+        self,
+        *,
+        backend_alias,
+        queues,
+        concurrency,
+        poll_interval,
+        lock_timeout,
+        worker_index,
+        parent_pid,
+        db_alias,
+    ):
+        super().__init__(
+            backend_alias=backend_alias,
+            queues=queues,
+            concurrency=concurrency,
+            poll_interval=poll_interval,
+            lock_timeout=lock_timeout,
+            worker_index=worker_index,
+            parent_pid=parent_pid,
+            db_alias=db_alias,
+        )
+
+    def run(self):
+        FixedSignatureWorker.started = True
+
+
 @pytest.fixture
 def recorded_worker(monkeypatch):
     WorkerRecorder.instances = []
@@ -423,3 +455,36 @@ def test_unknown_backend_cli(tmp_path, processes, traceback):
         assert result.stderr.endswith(message)
     else:
         assert result.stderr == message
+
+
+def test_a_fixed_signature_worker_class_runs_without_the_new_flags(settings):
+    settings.TASKS = {
+        "default": {
+            "BACKEND": "django_ox.backend.OxBackend",
+            "OPTIONS": {"WORKER_CLASS": "tests.test_command.FixedSignatureWorker"},
+        }
+    }
+    FixedSignatureWorker.started = False
+
+    with pytest.raises(SystemExit) as excinfo:
+        call_command("ox_worker")
+
+    assert excinfo.value.code == 0
+    assert FixedSignatureWorker.started is True
+
+
+def test_batch_and_max_tasks_reach_the_worker(recorded_worker):
+    with pytest.raises(SystemExit) as excinfo:
+        call_command("ox_worker", "--batch", "--max-tasks=3")
+    assert excinfo.value.code == 0
+    (worker,) = recorded_worker.instances
+    assert worker.kwargs["batch"] is True
+    assert worker.kwargs["max_tasks"] == 3
+
+
+def test_neither_is_passed_unless_asked_for(recorded_worker):
+    with pytest.raises(SystemExit):
+        call_command("ox_worker", verbosity=0)
+    (worker,) = recorded_worker.instances
+    assert "batch" not in worker.kwargs
+    assert "max_tasks" not in worker.kwargs

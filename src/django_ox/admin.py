@@ -14,6 +14,10 @@ get_queryset methods below say so. A ModelAdmin builds its queryset from the
 default manager, which follows db_for_read. Under a router that sends reads
 to a replica these pages would answer from a database no worker writes, and
 the change form submits what it rendered.
+
+The queue overview is a separate page linked from the task list. It calls
+metrics.collect() once per visit, on the same alias; the change list itself
+runs none of those aggregate queries.
 """
 
 from __future__ import annotations
@@ -35,12 +39,16 @@ from django.db.models import (
     Value,
 )
 from django.db.models.functions import Concat
-from django.http import HttpRequest
+from django.http import HttpRequest, HttpResponse
+from django.template.response import TemplateResponse
+from django.urls import path
 from django.utils import timezone
+from django.utils.decorators import method_decorator
 from django.utils.html import format_html, format_html_join
 from django.utils.module_loading import import_string
+from django.views.decorators.http import require_safe
 
-from . import actions, registry, stored
+from . import actions, metrics, registry, stored
 from .compat import DEFAULT_TASK_BACKEND_ALIAS
 from .models import OxSchedule, OxScheduleTick, OxTask
 from .schedules import STORED_KEY_PREFIX
@@ -59,6 +67,25 @@ else:
 ERROR_TEMPLATE = (
     '<p><strong>Attempt {}: {}</strong></p><pre style="white-space: pre-wrap">{}</pre>'
 )
+
+
+def _format_age(seconds: float | None) -> str:
+    """A compact duration for the overview's operator-facing table."""
+    if seconds is None:
+        return "—"
+    remaining = max(0, int(seconds))
+    days, remaining = divmod(remaining, 86_400)
+    hours, remaining = divmod(remaining, 3_600)
+    minutes, seconds = divmod(remaining, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours or parts:
+        parts.append(f"{hours}h")
+    if minutes or parts:
+        parts.append(f"{minutes}m")
+    parts.append(f"{seconds}s")
+    return " ".join(parts)
 
 
 @admin.register(OxTask)
@@ -181,6 +208,73 @@ class OxTaskAdmin(_ModelAdmin):
         detail page for one that exists reports it as deleted.
         """
         return super().get_queryset(request).using(router.db_for_write(self.model))
+
+    def get_urls(self) -> list[Any]:
+        urls = super().get_urls()
+        overview = self.admin_site.admin_view(self.overview)
+        return [
+            path("overview/", overview, name="django_ox_oxtask_overview"),
+            *urls,
+        ]
+
+    @method_decorator(require_safe)
+    def overview(self, request: HttpRequest) -> HttpResponse:
+        """The per-queue readings, collected once from the write alias."""
+        if not self.has_view_permission(request):
+            raise PermissionDenied
+
+        alias = router.db_for_write(self.model)
+        families = {
+            family.name: family.samples for family in metrics.collect(using=alias)
+        }
+        statuses: dict[str, dict[str, int]] = {}
+        for labels, value in families["django_ox_tasks"]:
+            statuses.setdefault(labels["queue"], {})[labels["status"]] = int(value)
+
+        def by_queue(name: str) -> dict[str, float]:
+            return {labels["queue"]: value for labels, value in families[name]}
+
+        eligible = by_queue("django_ox_ready_tasks")
+        oldest = by_queue("django_ox_oldest_ready_age_seconds")
+        claims = by_queue("django_ox_last_claim_age_seconds")
+        throughput = by_queue("django_ox_throughput_per_minute")
+        failure = by_queue("django_ox_failure_rate")
+        rows = []
+        for queue_name, counts in sorted(statuses.items()):
+            finished = queue_name in failure
+            rows.append(
+                {
+                    "queue_name": queue_name,
+                    "ready": counts.get("ready", 0),
+                    "eligible_ready": int(eligible.get(queue_name, 0)),
+                    "running": counts.get("running", 0),
+                    "waiting": counts.get("waiting", 0),
+                    "failed": counts.get("failed", 0),
+                    "successful": counts.get("successful", 0),
+                    "lost": counts.get("lost", 0),
+                    "discarded": counts.get("discarded", 0),
+                    "oldest_age": _format_age(oldest.get(queue_name)),
+                    "throughput": (
+                        f"{throughput[queue_name]:.2f}" if finished else "—"
+                    ),
+                    "failure_rate": f"{failure[queue_name]:.2%}" if finished else "—",
+                    "last_claim_age": (
+                        _format_age(claims[queue_name])
+                        if queue_name in claims
+                        else "never"
+                    ),
+                }
+            )
+        context = {
+            **self.admin_site.each_context(request),
+            "title": "Queue overview",
+            "opts": self.opts,
+            "rows": rows,
+            "as_of": timezone.now(),
+        }
+        return TemplateResponse(
+            request, "admin/django_ox/oxtask/queue_overview.html", context
+        )
 
     @admin.display(description="Attempt errors")
     def attempt_errors(self, obj: OxTask) -> str:

@@ -47,14 +47,24 @@ Run `python manage.py migrate django_ox` to create the table.
 The decorator, `.enqueue()`, and result API stay the same. Worker options
 and queue selection differ.
 
-Of `db_worker`'s worker-specific options, only `--backend` and `--interval`
-carry over unchanged.
+Of `db_worker`'s worker-specific options, `--backend`, `--interval`,
+`--batch` and `--max-tasks` carry over by name.
 
 - Replace `--queue-name` with `--queues`.
-- Remove `--batch`, `--max-tasks`, `--reload`, `--no-reload`,
-  `--exclude-queues`, `--worker-id`, and `--no-startup-delay`.
-  `ox_worker` rejects these options as unrecognized arguments.
-- `ox_worker` does not support exit-when-idle or task-count limits.
+- `--batch` maps by name to `--batch`. In `ox_worker`, it ends after an
+  error-free empty claim pass with no local tasks in flight; it does not
+  wait for future tasks, retry backoff or deferred releases. `db_worker`
+  exits with a traceback when the database is unreachable or its tables are
+  missing. `ox_worker` keeps retrying, a failed schedule dispatch included,
+  and doesn't end the batch until a retry succeeds. Give the job a timeout,
+  as [Running as a job](production.md#running-as-a-job) explains.
+- `--max-tasks N` maps by name to `--max-tasks N`. In `ox_worker`, every
+  claimed attempt consumes one of N, including failed attempts and repeat
+  claims of the same task. These mappings do not imply identical completion
+  or retry semantics between the workers.
+- Remove `--reload`, `--no-reload`, `--exclude-queues`, `--worker-id`, and
+  `--no-startup-delay`. `ox_worker` rejects these options as unrecognized
+  arguments.
 - `ox_worker` does not autoreload. Without `--batch`, `db_worker` enables
   autoreload by default when `settings.DEBUG` is true.
 - `db_worker` runs only the `default` queue unless configured otherwise.

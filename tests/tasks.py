@@ -281,3 +281,23 @@ def query_then_sleep(log_path, seconds):
     time.sleep(seconds)
     _mark(log_path, "END")
     return "done"
+
+
+@task
+def enqueue_follow_up(label):
+    """Enqueue another task from inside one, as a fan-out job does."""
+    echo.enqueue(label)
+    return label
+
+
+@task
+def enqueue_follow_up_once_released(label):
+    """
+    enqueue_follow_up, held until the test sets STATE["release"], so the test
+    decides the moment the follow-up appears. Gives up after ten seconds
+    rather than hold a worker thread for a test that never lets it go.
+    """
+    if not STATE["release"].wait(10):
+        raise TimeoutError("the test never released this task")
+    echo.enqueue(label)
+    return label

@@ -20,6 +20,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
         with:
+          persist-credentials: false
           # Gitleaks scans commits, not just the worktree, so it needs history.
           fetch-depth: 0
       # The gitleaks CLI is MIT and free. Its GitHub Action wrapper requires a
@@ -52,6 +53,8 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          persist-credentials: false
       - uses: github/codeql-action/init@b96794f015dfd88f77b49b1c93e0fa7110f94c63  # v4.38.0
         with:
           languages: python
@@ -67,6 +70,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7
         with:
           python-version: "3.12"
@@ -96,6 +101,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          persist-credentials: false
       - name: No credential-shaped files tracked
         run: |
           set -uo pipefail
@@ -105,3 +112,39 @@ jobs:
             exit 1
           fi
           echo "No credential-shaped files tracked."
+
+  # zizmor with a token, which turns on the audits that ask GitHub about each
+  # pinned action: impostor-commit (the SHA must be on a branch or tag of the
+  # action's own repository, not only in a fork), known-vulnerable-actions and
+  # ref-version-mismatch. The ci.yml run stays offline because it sits under
+  # ci-ok, which branch protection requires, and these answers can change
+  # while the tree does not: an API outage, or a new advisory against a
+  # reviewed pin. Here a failure shows on the pull request and the weekly run
+  # but blocks no merge. Same binary, checksum and flags as ci.yml; bump both
+  # together.
+  zizmor-online:
+    name: zizmor online audits
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          persist-credentials: false
+      - name: Install zizmor
+        working-directory: ${{ runner.temp }}
+        env:
+          ZIZMOR_VERSION: "1.30.1"
+          ZIZMOR_SHA256: "e65324f4430c2717591937edcec90ccbefaf14c174f8ec9415e03ca875b46e1a"
+        run: |
+          set -euo pipefail
+          curl -sSfL -o zizmor.tar.gz \
+            "https://github.com/zizmorcore/zizmor/releases/download/v${ZIZMOR_VERSION}/zizmor-x86_64-unknown-linux-gnu.tar.gz"
+          echo "${ZIZMOR_SHA256}  zizmor.tar.gz" | sha256sum -c -
+          tar -xzf zizmor.tar.gz
+          install zizmor /usr/local/bin/zizmor
+          zizmor --version
+      - name: Audit GitHub Actions (online)
+        env:
+          # Read-only: this workflow grants contents: read and nothing else.
+          GH_TOKEN: ${{ github.token }}
+        run: zizmor --strict-collection --collect=all --no-config --no-ignores .

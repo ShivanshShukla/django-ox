@@ -79,6 +79,23 @@ class Command(DatabaseCommand):
                 "thread pool of --concurrency (default: %(default)s)."
             ),
         )
+        parser.add_argument(
+            "--batch",
+            action="store_true",
+            help=(
+                "Exit once a poll pass finds nothing to claim and no task is "
+                "running, instead of waiting for more work."
+            ),
+        )
+        parser.add_argument(
+            "--max-tasks",
+            default=None,
+            metavar="N",
+            help=(
+                "Exit after claiming N task attempts, counting failed "
+                "attempts and retries."
+            ),
+        )
         # Set by the supervisor on each child; names the slot in worker ids.
         parser.add_argument(
             "--worker-index", type=int, default=None, help=argparse.SUPPRESS
@@ -90,6 +107,14 @@ class Command(DatabaseCommand):
         supervisor_pid = os.environ.pop(SUPERVISOR_PID_ENV, None)
         if options["processes"] < 1:
             raise CommandError("--processes must be at least 1.")
+        max_tasks = _max_tasks(options["max_tasks"])
+        if options["processes"] > 1 and (options["batch"] or max_tasks is not None):
+            # The supervisor restarts a child that exits unasked, so a
+            # planned exit would be undone rather than honoured.
+            raise CommandError(
+                "--batch and --max-tasks run one worker process; they cannot "
+                "be combined with --processes above 1."
+            )
         # Before the supervisor branch, so a bad alias is reported by the
         # parent rather than by every child it starts.
         alias = self.database(options)
@@ -142,6 +167,14 @@ class Command(DatabaseCommand):
             if options["queues"]
             else None
         )
+        # Only when asked for: a WORKER_CLASS with a fixed-signature
+        # constructor keeps working on every invocation that does not use
+        # these flags.
+        completion: dict[str, Any] = {}
+        if options["batch"]:
+            completion["batch"] = True
+        if max_tasks is not None:
+            completion["max_tasks"] = max_tasks
         worker = worker_class(options["backend"])(
             backend_alias=options["backend"],
             queues=queues,
@@ -151,6 +184,7 @@ class Command(DatabaseCommand):
             worker_index=options["worker_index"],
             parent_pid=parent_pid,
             db_alias=alias,
+            **completion,
         )
 
         retire_signal_thread = install_stop_handlers(worker)
@@ -175,6 +209,23 @@ class Command(DatabaseCommand):
             sys.stderr.flush()
             os._exit(RECYCLE_EXIT_CODE)
         sys.exit(0)
+
+
+def _max_tasks(value: str | None) -> int | None:
+    # Validated here rather than with argparse's type=int, whose rejection
+    # exits 2; an invalid limit is a CommandError like every other bad
+    # option to this command.
+    if value is None:
+        return None
+    try:
+        limit = int(value)
+    except ValueError:
+        limit = 0
+    if limit < 1:
+        raise CommandError(
+            f"--max-tasks must be an integer of at least 1, not {value!r}."
+        )
+    return limit
 
 
 def install_stop_handlers(worker: Worker) -> Callable[[], None]:

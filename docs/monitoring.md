@@ -300,6 +300,8 @@ The message text is not part of the contract. The keys are.
 | `worker_drain_abandoned` | WARNING | A recycling worker stopped waiting on tasks that had not finished. Their leases expire and the reaper requeues them. Carries `pending`. |
 | `claim_filter_sql_missing` | WARNING | Once per worker: a subclass overrides `claim_filter_q()` without `claim_filter_sql()`, so the single-statement PostgreSQL claim is given up for the path that applies the hook. |
 | `worker_draining` | INFO | Shutdown began with tasks still in flight. |
+| `worker_batch_empty` | INFO | Under `--batch`, a poll pass succeeded, claimed nothing, and left no task running. The worker drains and stops. Carries `claimed`. |
+| `worker_max_tasks_reached` | INFO | Under `--max-tasks`, the worker claimed its limit. It drains and stops. Carries `claimed`. |
 | `worker_stopped` | INFO | The run loop exited. |
 | `supervisor_started` | INFO | `ox_worker --processes N` started its worker processes. |
 | `worker_process_restarted` | WARNING | A worker process exited on its own and is being restarted. |
@@ -327,6 +329,8 @@ A failed connect while recording a stuck attempt logs
 | --- | --- | --- |
 | `event` | all events | The event name from the table above. |
 | `worker_id` | all worker events | Unique id of the worker emitting the record. With `--processes`, the slot number is the last part of the id. |
+| `worker_class` | `claim_filter_sql_missing` | The Worker subclass's class name. |
+| `claimed` | `worker_batch_empty`, `worker_max_tasks_reached` | Task attempts this worker claimed in its run, failed attempts and retries included. |
 | `task_id` | task events | The task's UUID, as a string. |
 | `task_path` | task events | Dotted path of the task function. |
 | `queue` | task events | Queue name. |
@@ -505,5 +509,23 @@ action does not accept.
 
 The admin does not add, edit or delete rows. A hand-edited status would
 bypass the lease, and a delete could take a row from under a running
-worker; `ox_prune` is the way rows leave the table. The actions need the
-`change_oxtask` permission; viewing needs `view_oxtask`.
+worker; `ox_prune` is the way rows leave the table. The actions need
+`change_oxtask`; viewing accepts either `view_oxtask` or `change_oxtask`.
+
+Open **Queue overview** from the task change list. It shows one row per
+queue with retained task rows: status counts, eligible READY tasks, the
+oldest eligible task's age, throughput per minute, failure rate, and time
+since the last claim.
+
+READY includes deferred tasks; Eligible ready excludes them. Throughput and
+failure rate cover the trailing five minutes. Both display a dash when no
+task finished in that window. Status totals count retained rows, not
+lifetime activity. An absent oldest eligible age displays a dash; no
+recorded claim displays `never`. Last claim age is not a heartbeat or proof
+that a worker is alive.
+
+Each visit scans retained task rows, so cost grows with retention. The page
+does not refresh automatically. It uses the database alias selected by
+`router.db_for_write(OxTask)`, not the worker's `--database` flag. To show
+rows processed by `ox_worker --database other`, that router selection must
+also resolve to `other`.

@@ -13,13 +13,15 @@ import threading
 import time
 
 import pytest
-from django.db import InterfaceError, OperationalError
+from django.db import DataError, InterfaceError, OperationalError
 from django.utils import timezone
 
 from django_ox.models import OxTask
 from django_ox.worker import Worker
 
 from . import tasks
+from .conftest import start_worker_thread, wait_for
+from .test_schedules import MINUTELY_ADD, backdate_anchor, tasks_setting
 
 pytestmark = pytest.mark.django_db
 
@@ -348,3 +350,162 @@ class TestThePrivateDjangoAttributesStillExist:
             f"Django no longer has BaseDatabaseWrapper.{attribute}, so "
             "_discard_connections silently stops resetting it"
         )
+
+
+class TestABatchPassMustSucceed:
+    """
+    `--batch` ends run() on a pass that found nothing, and a pass the
+    database interrupted found out nothing: it cannot count as empty. A
+    failed schedule dispatch holds the batch open until one succeeds, since
+    the passes in between do not dispatch at all.
+    """
+
+    @pytest.fixture
+    def batch_worker(self, settings):
+        settings.TASKS = {
+            "default": {
+                "BACKEND": "django_ox.backend.OxBackend",
+                "QUEUES": ["default"],
+                "OPTIONS": {},
+            }
+        }
+        return self.make_worker()
+
+    @staticmethod
+    def make_worker(**kwargs):
+        # No schedule_interval: ox_worker never passes one, so dispatch runs
+        # at most once a second while the poll is far shorter, and most
+        # passes do not dispatch at all. A test that dispatched on every
+        # pass could not see a failure outliving the pass that had it.
+        worker = Worker(
+            backoff_initial=0,
+            poll_interval=0.02,
+            reap_interval=0.0,
+            batch=True,
+            **kwargs,
+        )
+        assert worker.schedule_interval > worker.poll_interval
+        return worker
+
+    @staticmethod
+    def break_dispatch(worker, monkeypatch, *, failures, error=OperationalError):
+        """
+        Make the worker's first `failures` dispatches raise `error`, or every
+        one when it is None. Returns the attempts, one entry each.
+        """
+        calls = []
+        real_dispatch = worker.dispatch_schedules
+
+        def dispatch():
+            calls.append(1)
+            if failures is None or len(calls) <= failures:
+                raise error("gone")
+            return real_dispatch()
+
+        monkeypatch.setattr(worker, "dispatch_schedules", dispatch)
+        return calls
+
+    def run_to_completion(self, worker, caplog):
+        # Registered, so a batch that never finishes is stopped and joined
+        # when the test ends instead of claiming the next test's tasks.
+        with caplog.at_level(logging.INFO, logger="django_ox"):
+            thread = start_worker_thread(worker)
+            thread.join(timeout=10)
+        assert not thread.is_alive(), "the batch worker never finished"
+
+    @pytest.mark.django_db(transaction=True)
+    def test_a_failed_claim_is_not_an_empty_pass(
+        self, batch_worker, monkeypatch, caplog
+    ):
+        calls = []
+        real_claim = batch_worker.claim_one
+
+        def claim_once_broken():
+            calls.append(1)
+            if len(calls) == 1:
+                raise OperationalError("gone")
+            return real_claim()
+
+        monkeypatch.setattr(batch_worker, "claim_one", claim_once_broken)
+        self.run_to_completion(batch_worker, caplog)
+
+        assert events(caplog, "worker_poll_failed")
+        assert len(calls) >= 2, "the pass the database interrupted ended the batch"
+        (done,) = events(caplog, "worker_batch_empty")
+        assert done.worker_id == batch_worker.worker_id
+        assert done.claimed == 0
+
+    @pytest.mark.django_db(transaction=True)
+    def test_a_failed_schedule_dispatch_is_not_an_empty_pass(
+        self, batch_worker, monkeypatch, caplog
+    ):
+        calls = []
+        real_dispatch = batch_worker.dispatch_schedules
+
+        def dispatch_once_broken():
+            calls.append(1)
+            if len(calls) == 1:
+                raise OperationalError("gone")
+            return real_dispatch()
+
+        monkeypatch.setattr(batch_worker, "dispatch_schedules", dispatch_once_broken)
+        self.run_to_completion(batch_worker, caplog)
+
+        assert events(caplog, "schedule_dispatch_failed")
+        assert len(calls) >= 2, "the pass whose dispatch failed ended the batch"
+        assert len(events(caplog, "worker_batch_empty")) == 1
+
+    @pytest.mark.django_db(transaction=True)
+    def test_a_due_tick_whose_dispatch_failed_runs_before_the_batch_ends(
+        self, settings, monkeypatch, caplog
+    ):
+        settings.TASKS = tasks_setting(MINUTELY_ADD)
+        # First sight anchors the schedule without firing it.
+        Worker().dispatch_schedules()
+        backdate_anchor("minutely-add", 1)
+        worker = self.make_worker()
+        calls = self.break_dispatch(worker, monkeypatch, failures=1)
+        self.run_to_completion(worker, caplog)
+
+        assert len(calls) >= 2, "the batch ended without retrying the dispatch"
+        (row,) = OxTask.objects.all()
+        assert row.task_path == "tests.tasks.add"
+        assert row.status == OxTask.Status.SUCCESSFUL
+        (done,) = events(caplog, "worker_batch_empty")
+        assert done.claimed == 1
+
+    # DataError stands for a schedule the database rejects on every
+    # dispatch, which the job docs say holds the batch until its timeout.
+    @pytest.mark.parametrize("error", [OperationalError, DataError])
+    @pytest.mark.django_db(transaction=True)
+    def test_a_dispatch_that_keeps_failing_holds_the_batch_open(
+        self, batch_worker, monkeypatch, caplog, error
+    ):
+        calls = self.break_dispatch(
+            batch_worker, monkeypatch, failures=None, error=error
+        )
+        with caplog.at_level(logging.INFO, logger="django_ox"):
+            thread = start_worker_thread(batch_worker)
+            # The second attempt comes a schedule_interval after the first,
+            # across passes that find nothing. A batch that ended on one of
+            # those never makes it.
+            wait_for(lambda: len(calls) >= 2 or not thread.is_alive(), timeout=30)
+            assert thread.is_alive(), "the batch ended with a dispatch still owed"
+            batch_worker.request_stop()
+            thread.join(timeout=10)
+        assert not thread.is_alive()
+        assert len(calls) >= 2
+        assert not events(caplog, "worker_batch_empty")
+
+    @pytest.mark.django_db(transaction=True)
+    def test_an_owed_dispatch_does_not_hold_back_the_task_limit(
+        self, batch_worker, monkeypatch, caplog
+    ):
+        result = tasks.add.enqueue(1, 2)
+        batch_worker.max_tasks = 1
+        self.break_dispatch(batch_worker, monkeypatch, failures=None)
+        self.run_to_completion(batch_worker, caplog)
+
+        assert OxTask.objects.get(id=result.id).status == OxTask.Status.SUCCESSFUL
+        (done,) = events(caplog, "worker_max_tasks_reached")
+        assert done.claimed == 1

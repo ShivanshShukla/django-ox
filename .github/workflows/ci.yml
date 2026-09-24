@@ -26,6 +26,8 @@ jobs:
       PYTHONFAULTHANDLER: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7
         with:
           python-version: ${{ matrix.python-version }}
@@ -71,6 +73,8 @@ jobs:
       PYTHONFAULTHANDLER: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7
         with:
           python-version: ${{ matrix.python-version }}
@@ -120,6 +124,8 @@ jobs:
       TZ: "America/Los_Angeles"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7
         with:
           python-version: "3.13"
@@ -168,6 +174,8 @@ jobs:
       PYTHONFAULTHANDLER: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7
         with:
           python-version: ${{ matrix.python-version }}
@@ -213,6 +221,8 @@ jobs:
       PYTHONFAULTHANDLER: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7
         with:
           python-version: "3.12"
@@ -235,11 +245,66 @@ jobs:
         env:
           DJANGO_SETTINGS_MODULE: tests.settings_postgres
 
+  # Wagtail queues a search-index update through django_tasks.task on every
+  # save of an indexed model. The suite never drives a real Wagtail project, so
+  # "publish a page, the worker indexes it" was a claim rather than a fact.
+  # tools/wagtail_smoke.py publishes a page in a fresh `wagtail start` project on
+  # SQLite and requires the update to wait in the queue, run through ox_worker,
+  # and turn up in search.
+  #
+  # Two legs, one per task path. Wagtail imports django_tasks on both: on 5.2
+  # it is the backport django_ox.compat targets, on 6.1 its decorator hands
+  # task construction to the configured backend's task class.
+  #
+  # ==, not ranges: a Wagtail, modelsearch, Django or django-tasks release
+  # changes what this job runs only when a pin here is bumped. modelsearch is
+  # Wagtail's search library: it defines the index-update task and the signal
+  # handler that queues it, so each leg pins it beside Wagtail.
+  wagtail-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python-version: "3.12"
+            django-version: "5.2.17"
+            wagtail-version: "7.4.3"
+            modelsearch-version: "1.3.2"
+            checkout-install: '-e ".[backport]"'
+          - python-version: "3.14"
+            django-version: "6.1.1"
+            wagtail-version: "8.0"
+            modelsearch-version: "1.3.2"
+            checkout-install: "-e ."
+    name: wagtail smoke py${{ matrix.python-version }} dj${{ matrix.django-version }} wagtail${{ matrix.wagtail-version }}
+    env:
+      PYTHONFAULTHANDLER: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m pip install --upgrade pip
+      - run: >-
+          python -m pip install ${{ matrix.checkout-install }}
+          "Django==${{ matrix.django-version }}"
+          "wagtail==${{ matrix.wagtail-version }}"
+          "modelsearch==${{ matrix.modelsearch-version }}"
+          "django-tasks==0.12.0"
+      # Every wait inside the driver is bounded, and a failure prints the worker
+      # log, the task statuses and the active search backend.
+      - run: python tools/wagtail_smoke.py
+
   lint:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7
         with:
           python-version: "3.12"
@@ -255,6 +320,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7
         with:
           python-version: "3.12"
@@ -269,6 +336,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7
         with:
           python-version: "3.12"
@@ -283,6 +352,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7
         with:
           python-version: "3.12"
@@ -292,6 +363,38 @@ jobs:
       # Catches a README that would fail to render on the package page.
       - run: twine check --strict dist/*
 
+  # Static analysis of these workflows. It sits under ci-ok because ci-ok is
+  # the only check branch protection requires. The binary is installed rather
+  # than zizmor-action because the action reports through SARIF by default,
+  # which never fails the job. Pinned by version and sha256 like gitleaks in
+  # security.yml; dependabot cannot see the pin, so bump both by hand.
+  zizmor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          persist-credentials: false
+      - name: Install zizmor
+        working-directory: ${{ runner.temp }}
+        env:
+          ZIZMOR_VERSION: "1.30.1"
+          ZIZMOR_SHA256: "e65324f4430c2717591937edcec90ccbefaf14c174f8ec9415e03ca875b46e1a"
+        run: |
+          set -euo pipefail
+          curl -sSfL -o zizmor.tar.gz \
+            "https://github.com/zizmorcore/zizmor/releases/download/v${ZIZMOR_VERSION}/zizmor-x86_64-unknown-linux-gnu.tar.gz"
+          echo "${ZIZMOR_SHA256}  zizmor.tar.gz" | sha256sum -c -
+          tar -xzf zizmor.tar.gz
+          install zizmor /usr/local/bin/zizmor
+          zizmor --version
+      # Plain output retains nonzero exit codes for findings, including info.
+      # The last three flags stop a zizmor.yml, an inline ignore comment or a
+      # .gitignore entry from silencing a finding, so loosening this gate
+      # always means editing this step.
+      - name: Audit GitHub Actions
+        run: zizmor --strict-collection --collect=all --no-config --no-ignores .
+
   # The one context branch protection requires. Requiring a single summary
   # job instead of every matrix leg means the protection rule survives
   # matrix changes: add a Python or database to the grid and the rule
@@ -299,14 +402,16 @@ jobs:
   ci-ok:
     name: ci-ok
     if: always()
-    needs: [test-sqlite, test-postgres, test-postgres-naive, test-backport-floor, test-mysql, lint, types, docs, packaging]
+    needs: [test-sqlite, test-postgres, test-postgres-naive, test-backport-floor, wagtail-smoke, test-mysql, lint, types, docs, packaging, zizmor]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - name: Every required job succeeded
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
         run: |
           set -euo pipefail
-          echo '${{ toJSON(needs) }}'
+          printf '%s\n' "$NEEDS_JSON"
           [ "${{ contains(needs.*.result, 'failure') }}" = "false" ]
           [ "${{ contains(needs.*.result, 'cancelled') }}" = "false" ]
           [ "${{ contains(needs.*.result, 'skipped') }}" = "false" ]

@@ -121,6 +121,54 @@ processes included: `enqueue()` writes every column the current schema has.
 Run them as an init container or a job, not from the worker itself; several
 workers starting at once would race the same migration.
 
+## Running as a job
+
+For cron and job runners, `--batch` stops after an error-free polling pass
+observes no claimable task, claims nothing, and began claiming with no local
+tasks in flight. If a schedule dispatch failed, a later one must succeed
+first. `--max-tasks N` stops after N claimed attempts, including failed
+attempts and repeat claims of retries; without `--batch`, an empty queue does
+not end the run. Combined, the first completion condition reached stops
+further claims and drains in-flight tasks. Normal completion exits 0 even if
+attempts failed; recycling and forced shutdown retain their existing exit
+codes.
+
+```
+python manage.py ox_worker --batch --concurrency 4
+```
+
+"Nothing to claim" is a point-in-time observation by this worker, not a
+guarantee that the queue is empty or a workflow is complete. Future
+`run_after` tasks, backed-off retries, locked tasks and tasks excluded by
+claim filters may remain. With [Oxpull Pro](pro.md), rate-limited READY tasks
+and WAITING workflow children may remain too. A pass that sees due tasks but
+loses them all to other workers isn't empty, and the worker polls again.
+Immediately eligible follow-up work committed before a local task finishes
+can be picked up on a subsequent pass, unless another stop condition wins.
+Batch mode does not wait for later commits, schedule ticks or reconciler
+hand-offs; arrange another run or use a long-running worker for that work.
+
+Schedules dispatch only while a worker runs. A batch checks them when it
+starts and keeps checking while it runs. Each schedule then enqueues only its
+most recent missed tick. A schedule that ticks more often than the job runs
+skips the ticks in between. A run that sees a schedule declared in settings
+for the first time records its current tick without enqueuing it; a stored
+schedule fires its first due tick. Use a long-running worker for more
+frequent schedule checks, but missed ticks are still coalesced; this does not
+guarantee that every tick runs. See [Missed ticks](recurring-tasks.md#missed-ticks).
+
+A database error doesn't end a batch, whether the server is unreachable or
+the django-ox tables are missing. Each failed pass is retried, as it is for a
+long-running worker, and a failed pass never counts as an empty one. So a
+worker in a job keeps retrying for as long as the error lasts. That includes
+a schedule the database rejects on every dispatch, which holds every batch
+run, so alert on `schedule_dispatch_failed`. Give the job runner a timeout:
+it is what bounds a run against a failing database.
+
+Both flags run a single process. `--processes` above 1 is rejected, because
+the supervisor restarts a worker that exits on its own; for more throughput in
+one job, raise `--concurrency`, or run several jobs.
+
 ## Graceful shutdown
 
 On SIGTERM or SIGINT the worker:
