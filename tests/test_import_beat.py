@@ -17,6 +17,7 @@ pytestmark = pytest.mark.django_db(transaction=True)
 
 def make_beat_tables():
     """A minimal stand-in for the tables django-celery-beat creates."""
+    dt_type = connection.data_types.get("DateTimeField", "datetime")
     with connection.cursor() as cursor:
         cursor.execute(
             "CREATE TABLE django_celery_beat_crontabschedule ("
@@ -29,10 +30,11 @@ def make_beat_tables():
             "id integer primary key, every integer, period varchar(24))"
         )
         cursor.execute(
-            "CREATE TABLE django_celery_beat_periodictask ("
-            "id integer primary key, name varchar(200), task varchar(200), "
-            "args text, kwargs text, queue varchar(200), enabled boolean, "
-            "crontab_id integer, interval_id integer)"
+            f"CREATE TABLE django_celery_beat_periodictask ("
+            f"id integer primary key, name varchar(200), task varchar(200), "
+            f"args text, kwargs text, queue varchar(200), enabled boolean, "
+            f"crontab_id integer, interval_id integer, one_off boolean, "
+            f"start_time {dt_type}, expires {dt_type})"
         )
         cursor.execute(
             "INSERT INTO django_celery_beat_crontabschedule "
@@ -48,16 +50,63 @@ def make_beat_tables():
         # Parameterised, and booleans passed as booleans: PostgreSQL will not
         # accept 1 for a boolean column where SQLite and MySQL both would.
         rows = [
-            (1, "nightly", "reports.tasks.daily", None, True, 1, None),
-            (2, "poller", "mail.tasks.poll", "mail", True, None, 1),
-            (3, "orphan", "x.y.z", None, True, None, None),
+            (
+                1,
+                "nightly",
+                "reports.tasks.daily",
+                None,
+                True,
+                1,
+                None,
+                False,
+                None,
+                None,
+            ),
+            (
+                2,
+                "poller",
+                "mail.tasks.poll",
+                "mail",
+                True,
+                None,
+                1,
+                False,
+                None,
+                None,
+            ),
+            (3, "orphan", "x.y.z", None, True, None, None, False, None, None),
         ]
-        for pk, name, task, queue, enabled, crontab_id, interval_id in rows:
+        for (
+            pk,
+            name,
+            task,
+            queue,
+            enabled,
+            crontab_id,
+            interval_id,
+            one_off,
+            start_time,
+            expires,
+        ) in rows:
             cursor.execute(
                 "INSERT INTO django_celery_beat_periodictask "
                 "(id, name, task, args, kwargs, queue, enabled, crontab_id, "
-                "interval_id) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
-                [pk, name, task, "[]", "{}", queue, enabled, crontab_id, interval_id],
+                "interval_id, one_off, start_time, expires) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                [
+                    pk,
+                    name,
+                    task,
+                    "[]",
+                    "{}",
+                    queue,
+                    enabled,
+                    crontab_id,
+                    interval_id,
+                    one_off,
+                    start_time,
+                    expires,
+                ],
             )
 
 
@@ -107,6 +156,8 @@ def test_the_generated_calls_actually_run(beat_tables, monkeypatch):
     pinned an output that raised TypeError the moment anyone pasted it. A
     printed migration is only worth printing if it runs.
     """
+    from datetime import datetime
+
     from django_ox.registry import ScheduleKind, register
 
     monkeypatch.setattr("django_ox.registry._registry", {})
@@ -114,13 +165,18 @@ def test_the_generated_calls_actually_run(beat_tables, monkeypatch):
     for key in ("reports.tasks.daily", "mail.tasks.poll"):
         register(ScheduleKind(key=key, task=tasks.add))
 
-    calls = [line for line in run().splitlines() if line.startswith("create_schedule(")]
+    output = run()
+    assert "# 2. Create the schedules." in output
+    section_2 = output.split("# 2. Create the schedules.")[1]
+    calls = [
+        line for line in section_2.splitlines() if line.startswith("create_schedule(")
+    ]
     assert calls, "the command printed no calls to check"
 
     from django_ox.stored import create_schedule
 
     for call in calls:
-        eval(call, {"create_schedule": create_schedule})  # noqa: S307
+        eval(call, {"create_schedule": create_schedule, "datetime": datetime})  # noqa: S307
 
     assert OxSchedule.objects.count() == len(calls)
 
@@ -236,3 +292,168 @@ def test_a_database_it_cannot_reach_is_a_sentence(monkeypatch):
     with pytest.raises(CommandError) as caught:
         call_command("ox_import_beat_schedules")
     assert "Database unreachable: could not connect to server" in str(caught.value)
+
+
+def test_one_off_task_is_not_translated(beat_tables):
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "UPDATE django_celery_beat_periodictask SET one_off = %s WHERE id = 1",
+            [True],
+        )
+    output = run()
+    assert "nightly" not in [
+        line.split("name=")[1].split(",")[0].strip("'\"")
+        for line in output.splitlines()
+        if line.startswith("create_schedule(")
+    ]
+    assert "one-off tasks have no equivalent" in output
+
+
+def test_expired_task_is_not_translated(beat_tables):
+    past_iso = "2020-01-01 00:00:00"
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "UPDATE django_celery_beat_periodictask SET expires = %s WHERE id = 1",
+            [past_iso],
+        )
+    output = run()
+    assert "nightly" not in [
+        line.split("name=")[1].split(",")[0].strip("'\"")
+        for line in output.splitlines()
+        if line.startswith("create_schedule(")
+    ]
+    assert "it has expired" in output
+
+
+def test_expiry_at_or_before_future_start_is_not_translated(beat_tables):
+    future_start = "2099-01-02 00:00:00"
+    earlier_expiry = "2099-01-01 00:00:00"
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "UPDATE django_celery_beat_periodictask SET start_time = %s, "
+            "expires = %s WHERE id = 1",
+            [future_start, earlier_expiry],
+        )
+    output = run()
+    assert "nightly" not in [
+        line.split("name=")[1].split(",")[0].strip("'\"")
+        for line in output.splitlines()
+        if line.startswith("create_schedule(")
+    ]
+    assert "its expiry is at or before its start time" in output
+
+
+def test_future_start_and_expiry_are_preserved(beat_tables, monkeypatch):
+    from datetime import datetime
+
+    from django.utils import timezone
+
+    from django_ox.registry import ScheduleKind, register
+
+    monkeypatch.setattr("django_ox.registry._registry", {})
+    monkeypatch.setattr("django_ox.registry._discovered", True)
+    for key in ("reports.tasks.daily", "mail.tasks.poll"):
+        register(ScheduleKind(key=key, task=tasks.add))
+
+    future_start = "2099-01-01 10:00:00"
+    future_expiry = "2099-12-31 10:00:00"
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "UPDATE django_celery_beat_periodictask SET start_time = %s, "
+            "expires = %s WHERE id = 1",
+            [future_start, future_expiry],
+        )
+
+    output = run()
+    assert "start_time=datetime.fromisoformat(" in output
+    assert "end_time=datetime.fromisoformat(" in output
+
+    section_2 = output.split("# 2. Create the schedules.")[1]
+    calls = [
+        line for line in section_2.splitlines() if line.startswith("create_schedule(")
+    ]
+
+    from django_ox.stored import create_schedule
+
+    for call in calls:
+        eval(call, {"create_schedule": create_schedule, "datetime": datetime})  # noqa: S307
+
+    schedule = OxSchedule.objects.get(name="nightly")
+    if settings.USE_TZ:
+        expected_start = timezone.make_aware(
+            datetime.fromisoformat(future_start), connection.timezone
+        )
+        expected_end = timezone.make_aware(
+            datetime.fromisoformat(future_expiry), connection.timezone
+        )
+    else:
+        expected_start = datetime.fromisoformat(future_start)
+        expected_end = datetime.fromisoformat(future_expiry)
+
+    assert schedule.start_time == expected_start
+    assert schedule.end_time == expected_end
+
+
+def test_past_start_is_omitted(beat_tables):
+    past_start = "2020-01-01 00:00:00"
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "UPDATE django_celery_beat_periodictask SET start_time = %s WHERE id = 1",
+            [past_start],
+        )
+    output = run()
+    nightly_call = next(
+        line
+        for line in output.splitlines()
+        if line.startswith("create_schedule(") and "nightly" in line
+    )
+    assert "start_time=" not in nightly_call
+
+
+def test_old_table_without_new_columns(beat_tables):
+    """
+    An older django-celery-beat table without one_off, start_time, or expires
+    must still be imported cleanly.
+    """
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "ALTER TABLE django_celery_beat_periodictask DROP COLUMN one_off"
+        )
+        cursor.execute(
+            "ALTER TABLE django_celery_beat_periodictask DROP COLUMN start_time"
+        )
+        cursor.execute(
+            "ALTER TABLE django_celery_beat_periodictask DROP COLUMN expires"
+        )
+
+    output = run()
+    assert 'cron="0 2 * * *"' in output
+    assert "every_seconds=5400" in output
+
+
+def test_disabled_task_remains_disabled(beat_tables):
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "UPDATE django_celery_beat_periodictask SET enabled = %s WHERE id = 1",
+            [False],
+        )
+    output = run()
+    assert "enabled=False" in output
+
+
+def test_timezone_handling_use_tz(beat_tables):
+    from django.test import override_settings
+
+    future_start = "2099-05-01 12:00:00"
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "UPDATE django_celery_beat_periodictask SET start_time = %s WHERE id = 2",
+            [future_start],
+        )
+    with override_settings(USE_TZ=True, TIME_ZONE="America/New_York"):
+        output = run()
+        assert "start_time=datetime.fromisoformat(" in output
+
+    with override_settings(USE_TZ=False, TIME_ZONE="America/New_York"):
+        output = run()
+        assert "start_time=datetime.fromisoformat(" in output

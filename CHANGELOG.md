@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- `ox_import_beat_schedules` preserves supported `start_time` and `expires` bounds when importing schedules from `django-celery-beat`. It lists one-off rows, expired rows, and expiries at or before a future start under `# Not translated, and why:`, interprets naive cursor values using `connection.timezone` when `USE_TZ=True`, and warns about expiry before application in the footer.
+
 ## [1.4.0] - 2026-09-23
 
 If you use Django's PostgreSQL pool, check PostgreSQL `max_connections`
