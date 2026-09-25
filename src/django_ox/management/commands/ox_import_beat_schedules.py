@@ -9,7 +9,8 @@ yourself.
 from __future__ import annotations
 
 import json
-from datetime import datetime
+import math
+from datetime import UTC, datetime, timedelta, tzinfo
 from typing import Any
 
 from django.conf import settings
@@ -28,6 +29,38 @@ from .._database import DatabaseCommand
 BEAT_TABLE = "django_celery_beat_periodictask"
 CRONTAB_TABLE = "django_celery_beat_crontabschedule"
 INTERVAL_TABLE = "django_celery_beat_intervalschedule"
+
+FOOTER = (
+    "# Read before applying. Intervals are counted from a fixed instant here,\n"
+    "# not from the last run, so their fire times will differ from Celery's.\n"
+    "# Schedules are created with their enabled state preserved. Unless a\n"
+    "# start time is supplied, they start when created. If a printed start\n"
+    "# time passes before applying, the latest missed tick may run immediately.\n"
+    "# Enabling a disabled schedule resets its start time; check future starts\n"
+    "# before enabling.\n"
+    "# Start and expiry bounds are imported, with beat's exclusive expiry\n"
+    "# represented by an inclusive end_time one microsecond earlier. With\n"
+    "# USE_TZ=True, date bounds preserve their instants. With USE_TZ=False, date\n"
+    "# bounds are emitted as naive local times, not reinterpreted as UTC. This\n"
+    "# differs from django-celery-beat 2.9.0 with\n"
+    "# DJANGO_CELERY_BEAT_TZ_AWARE=False, which compares stored naive bounds\n"
+    "# against UTC wall time; review these bounds before applying the output.\n"
+    "# For a task that has never run and has a start_time, django-celery-beat\n"
+    "# 2.9.0 can run it once as soon as that time is reached or first observed\n"
+    "# after it has passed, then follow its schedule. The imported schedule does\n"
+    "# not reproduce that initial catch-up run; it waits for its first scheduled\n"
+    "# tick at or after start_time.\n"
+    "# If an expiry passes before applying, creation may fail or leave a\n"
+    "# schedule that never runs.\n"
+    "# Regenerate stale output before applying. After a partial application,\n"
+    "# inspect existing schedules and apply only the remaining calls; do not\n"
+    "# paste the whole output again.\n"
+    "# A queue or priority set on a beat task has no equivalent on a stored\n"
+    "# schedule; set it on the task."
+)
+
+#: What _decode returns for stored arguments that are not JSON.
+_INVALID = object()
 
 PERIOD_SECONDS = {
     "days": 86400,
@@ -69,18 +102,47 @@ class Command(DatabaseCommand):
                 "at the one holding your django-celery-beat schedules."
             )
 
-        rows = self._read(connection)
+        # Every row is read and converted before a line is printed. A stored
+        # value the driver cannot convert, such as PostgreSQL's 'infinity',
+        # an impossible date kept as text on SQLite or text SQLite cannot
+        # decode, fails while the cursor is iterated, where no single row can
+        # be set aside. A date bound that cannot be carried over as it is
+        # stops the import the same way. So it stops, in one line and before
+        # any output, rather than printing a traceback or half of what it
+        # would have printed.
+        try:
+            rows = self._read(connection)
+        except (DatabaseError, ValueError, OverflowError) as exc:
+            raise CommandError(
+                f"Cannot read beat schedules from database {alias!a}; check "
+                "database access and stored values."
+            ) from exc
         if not rows:
             self.stdout.write("No periodic tasks found.")
             return
+
+        # One reading of the clock for the whole import, so whether a row
+        # is translated, the reason it is not, and the bounds its call
+        # carries are all decided against the same instant.
+        now = timezone.now()
+        calls = []
+        skipped = []
+        for row in rows:
+            reason = self._skip_reason(row, now)
+            if reason is None:
+                calls.append(self._as_call(row, now))
+            else:
+                skipped.append((row["name"], reason))
 
         paths = sorted({row["task"] for row in rows})
         self.stdout.write(
             "# 1. Expose these tasks. A row can only name a key you list."
         )
         self.stdout.write('"SCHEDULABLE_TASKS": {')
+        # Literals through !a, like every stored value below: this fragment
+        # is pasted into settings.
         for path in paths:
-            self.stdout.write(f'    "{path}": "{path}",')
+            self.stdout.write(f"    {path!a}: {path!a},")
         self.stdout.write("},")
         self.stdout.write("")
         self.stdout.write("# 2. Create the schedules.")
@@ -88,30 +150,19 @@ class Command(DatabaseCommand):
         self.stdout.write("from django_ox.stored import create_schedule")
         self.stdout.write("")
 
-        skipped = []
-        for row in rows:
-            line = self._as_call(row)
-            if line is None:
-                skipped.append(row)
-                continue
-            self.stdout.write(line)
+        for call in calls:
+            self.stdout.write(call)
 
         if skipped:
             self.stdout.write("")
             self.stdout.write("# Not translated, and why:")
-            for row in skipped:
-                self.stdout.write(f"#   {row['name']}: {self._why(row)}")
+            for name, reason in skipped:
+                # A literal even inside a comment: a line break in a stored
+                # name would end the comment and paste the rest as code.
+                self.stdout.write(f"#   {name!a}: {reason}")
 
         self.stdout.write("")
-        self.stdout.write(
-            "# Read before applying. Intervals are counted from a fixed instant "
-            "here, not\n# from the last run, so their fire times will differ "
-            "from Celery's. Schedules\n# preserve their enabled state and start "
-            "from the moment you create\n# them unless given a start time. "
-            "An expiry near the present can\n# pass before applying, which will "
-            "fail validation at creation. A queue\n# or priority set on a beat "
-            "task has no equivalent on a stored\n# schedule; set it on the task."
-        )
+        self.stdout.write(FOOTER)
 
     def _read(self, connection: Any) -> list[dict[str, Any]]:
         tables = connection.introspection.table_names()
@@ -122,16 +173,30 @@ class Command(DatabaseCommand):
                     cursor, BEAT_TABLE
                 )
             }
+            # expires is in django-celery-beat's first migration, one_off and
+            # start_time arrived in its 0007. A table older than that reads
+            # them as NULL rather than failing on a column it never had.
             one_off_col = "one_off" if "one_off" in beat_columns else "NULL AS one_off"
             start_time_col = (
                 "start_time" if "start_time" in beat_columns else "NULL AS start_time"
             )
             expires_col = "expires" if "expires" in beat_columns else "NULL AS expires"
+            # Whether each date bound is NULL, asked of the database rather
+            # than read off the decoded value: a driver can decode a stored
+            # date it cannot represent as None, as mysqlclient does with
+            # MySQL's zero date and Django's SQLite converter with text it
+            # cannot parse, and that must not read as a row without a bound.
+            nulls = ", ".join(
+                f"CASE WHEN {name} IS NULL THEN 1 ELSE 0 END AS {name}_is_null"
+                if name in beat_columns
+                else f"1 AS {name}_is_null"
+                for name in ("start_time", "expires")
+            )
 
             cursor.execute(
                 f"SELECT name, task, args, kwargs, queue, enabled, "  # noqa: S608
                 f"crontab_id, interval_id, {one_off_col}, {start_time_col}, "
-                f"{expires_col} FROM {BEAT_TABLE}"
+                f"{expires_col}, {nulls} FROM {BEAT_TABLE}"
             )
             columns = [c[0] for c in cursor.description]
             rows = [dict(zip(columns, values, strict=True)) for values in cursor]
@@ -163,12 +228,37 @@ class Command(DatabaseCommand):
             row["_cron"] = crontabs.get(row["crontab_id"])
             row["_interval"] = intervals.get(row["interval_id"])
             row["_one_off"] = bool(row.get("one_off"))
-            row["_start_time"] = self._parse_datetime(row.get("start_time"), connection)
-            row["_expires"] = self._parse_datetime(row.get("expires"), connection)
+            row["_start_time"] = self._bound(row, "start_time", connection)
+            row["_expires"] = self._bound(row, "expires", connection)
+            row["_end_time"] = self._end_time(row["_expires"])
         return rows
+
+    def _bound(
+        self, row: dict[str, Any], name: str, connection: Any
+    ) -> datetime | None:
+        """
+        A row's start or expiry, which is None only where the database
+        holds NULL. A stored value read as no date at all is not a missing
+        bound, and dropping it would run the schedule outside its window.
+        """
+        value = self._parse_datetime(row[name], connection)
+        if value is None and not row[f"{name}_is_null"]:
+            raise ValueError(f"{name} is not NULL but was read as no date")
+        return value
 
     @staticmethod
     def _parse_datetime(val: Any, connection: Any) -> datetime | None:
+        """
+        A stored start or expiry, in the form the rest of the command uses.
+
+        With USE_TZ, Django writes a datetime to SQLite or MySQL without its
+        zone, in the zone of the connection: DATABASES TIME_ZONE when set,
+        UTC otherwise. So a naive value is read in the zone of the
+        connection it came from, the one --database names, not in UTC or in
+        TIME_ZONE. PostgreSQL returns aware values, which pass as they are.
+        Without USE_TZ every datetime is naive local time, and an aware one
+        is brought to it.
+        """
         if val is None:
             return None
         if isinstance(val, str):
@@ -183,59 +273,76 @@ class Command(DatabaseCommand):
             return val
         return None
 
-    def _as_call(self, row: dict[str, Any]) -> str | None:
-        if row["_one_off"]:
-            return None
+    @staticmethod
+    def _end_time(expires: datetime | None) -> datetime | None:
+        """
+        The last instant a stored schedule may fire at, for a beat expiry.
 
-        now = timezone.now()
-        start_time = row["_start_time"]
-        expires = row["_expires"]
-
-        if expires is not None and expires <= now:
+        Celery stops at its expiry: a tick that falls exactly on it does not
+        run. A stored schedule's end_time still fires a tick that falls on
+        it, so the bound moves back by the smallest step a datetime holds.
+        The step is taken on the UTC instant rather than on the wall clock,
+        where a zone's clock change can skip or repeat an hour: a microsecond
+        before 03:00 on a day that skips from 02:00 is 01:59:59 and a
+        fraction, while 02:59:59 never happens and PostgreSQL would store it
+        an hour later. A naive expiry is local time in TIME_ZONE, so it
+        steps back on the instant it names there and is printed as local
+        time again. One that happens twice or never there names no single
+        instant, and is refused rather than moved.
+        """
+        if expires is None:
             return None
-        if (
-            start_time is not None
-            and start_time > now
-            and expires is not None
-            and expires <= start_time
-        ):
-            return None
+        step = timedelta(microseconds=1)
+        if timezone.is_aware(expires):
+            return (expires.astimezone(UTC) - step).astimezone(expires.tzinfo)
+        zone = timezone.get_default_timezone()
+        if not _happens_once(expires, zone):
+            raise ValueError(f"{expires.isoformat()} is not one instant in {zone}")
+        return timezone.make_naive(
+            timezone.make_aware(expires, zone).astimezone(UTC) - step, zone
+        )
 
-        name = row["name"]
+    @staticmethod
+    def _future_start(row: dict[str, Any], now: datetime) -> datetime | None:
+        """
+        The row's start time, when it is still ahead.
+
+        create_schedule starts a schedule when it is created, which is later
+        than any start already past, so a past start adds nothing.
+        """
+        start = row["_start_time"]
+        return start if start is not None and start > now else None
+
+    def _as_call(self, row: dict[str, Any], now: datetime) -> str:
+        """The create_schedule call for a row _skip_reason lets through."""
         if row["_cron"]:
-            minute, hour, dom, month, dow, zone = row["_cron"]
-            if not self._same_zone(zone):
-                return None
-            timing = f'trigger="cron", cron="{minute} {hour} {dom} {month} {dow}"'
-        elif row["_interval"]:
+            minute, hour, dom, month, dow, _zone = row["_cron"]
+            cron = f"{minute} {hour} {dom} {month} {dow}"
+            timing = f'trigger="cron", cron={cron!a}'
+        else:
             every, period = row["_interval"]
             seconds = every * PERIOD_SECONDS.get(period, 0)
-            if seconds < 1:
-                return None
             timing = f'trigger="interval", every_seconds={seconds}'
-        else:
-            return None
-        if self._positional_args(row):
-            return None
         arguments = self._keyword_args(row)
 
+        start_time = self._future_start(row, now)
         start_arg = ""
-        if start_time is not None and start_time > now:
+        if start_time is not None:
             start_arg = (
-                f", start_time=datetime.fromisoformat({start_time.isoformat()!r})"
+                f", start_time=datetime.fromisoformat({start_time.isoformat()!a})"
             )
 
+        end_time = row["_end_time"]
         end_arg = ""
-        if expires is not None and expires > now:
-            end_arg = f", end_time=datetime.fromisoformat({expires.isoformat()!r})"
+        if end_time is not None:
+            end_arg = f", end_time=datetime.fromisoformat({end_time.isoformat()!a})"
 
         enabled = "" if row["enabled"] else ", enabled=False"
-        args = f", arguments={arguments!r}" if arguments else ""
-        # !r, not a hand-written quoted literal: a name holding a quote or a
-        # backslash would otherwise emit code that does not parse, or parses
-        # into something else, and the whole output is meant to be pasted.
+        args = f", arguments={arguments!a}" if arguments else ""
+        # Escape database-derived text with ascii() and reject non-finite numbers
+        # before emitting supported values as Python literals.
         return (
-            f"create_schedule(name={name!r}, task_key={row['task']!r}, "
+            f"create_schedule(name={row['name']!a}, task_key={row['task']!a}, "
             f"{timing}{args}{start_arg}{end_arg}{enabled})"
         )
 
@@ -268,10 +375,25 @@ class Command(DatabaseCommand):
 
     @staticmethod
     def _decode(raw: Any) -> Any:
-        try:
-            return json.loads(raw) if isinstance(raw, str) else raw
-        except (TypeError, ValueError):
+        """
+        Decode stored arguments without validating their JSON shape.
+
+        NULL and an empty string mean no arguments, as they do to beat.
+        Caught JSON decoding failures return _INVALID. Valid JSON is passed
+        to downstream argument handling; non-object kwargs are currently
+        treated as empty kwargs. Stored string args are JSON-decoded and
+        non-string values are used unchanged; truthy results trigger the
+        positional-arguments reason, while falsy results, including an empty
+        object, are treated as no arguments.
+        """
+        if raw is None or raw == "":
             return None
+        if not isinstance(raw, str):
+            return raw
+        try:
+            return json.loads(raw)
+        except ValueError:
+            return _INVALID
 
     def _positional_args(self, row: dict[str, Any]) -> bool:
         """A stored schedule passes keyword arguments only."""
@@ -281,37 +403,103 @@ class Command(DatabaseCommand):
         decoded = self._decode(row.get("kwargs"))
         return decoded if isinstance(decoded, dict) else {}
 
-    def _why(self, row: dict[str, Any]) -> str:
+    def _skip_reason(self, row: dict[str, Any], now: datetime) -> str | None:
+        """
+        Why a row cannot be translated, or None when it can.
+
+        The one place that decides, so a row is never printed as a call and
+        listed as skipped, and the reason listed is the check that failed.
+        """
         if row["_one_off"]:
             return "one-off tasks have no equivalent on a stored schedule"
-        if row["_cron"] and not self._same_zone(row["_cron"][5]):
-            return (
-                f"its schedule runs in {row['_cron'][5]}, and a stored "
-                f"schedule has no zone of its own: it would run in "
-                f"{settings.TIME_ZONE}, at a different time"
-            )
-        if row["_interval"]:
-            every, period = row["_interval"]
-            if every * PERIOD_SECONDS.get(period, 0) < 1:
+        if row["_cron"]:
+            zone = row["_cron"][5]
+            if not self._same_zone(zone):
                 return (
-                    f"an interval of {every} {period} is below one second, "
-                    "which the dispatch loop cannot honour"
+                    f"its schedule runs in {zone!a}, and a stored "
+                    f"schedule has no zone of its own: it would run in "
+                    f"{settings.TIME_ZONE!a}, at a different time"
                 )
+        elif row["_interval"]:
+            every, period = row["_interval"]
+            seconds = every * PERIOD_SECONDS.get(period, 0)
+            if not (math.isfinite(every) and math.isfinite(seconds)):
+                return "interval contains a non-finite number"
+            if seconds < 1:
+                return (
+                    f"an interval of {every!a} {period!a} is below one "
+                    "second, which the dispatch loop cannot honour"
+                )
+        elif row["crontab_id"] or row["interval_id"]:
+            return "its schedule row is missing"
+        else:
+            return "solar and clocked schedules have no equivalent"
+        for field in ("args", "kwargs"):
+            decoded = self._decode(row.get(field))
+            if decoded is _INVALID:
+                return f"{field} contains invalid JSON"
+            if _non_finite(decoded):
+                return f"{field} contains a non-finite number"
         if self._positional_args(row):
             return (
                 "it passes positional arguments, and a stored schedule takes "
                 "keyword arguments only; rewrite the task signature or the row"
             )
-        now = timezone.now()
-        if row["_expires"] is not None and row["_expires"] <= now:
+        return self._bounds_problem(row, now)
+
+    def _bounds_problem(self, row: dict[str, Any], now: datetime) -> str | None:
+        """Why a row's start and expiry leave no window to translate, or None."""
+        expires = row["_expires"]
+        if expires is None:
+            return None
+        # Celery counts a task as expired from the instant of its expiry.
+        if expires <= now:
             return "it has expired"
-        if (
-            row["_start_time"] is not None
-            and row["_start_time"] > now
-            and row["_expires"] is not None
-            and row["_expires"] <= row["_start_time"]
-        ):
+        start_time = self._future_start(row, now)
+        if start_time is not None and expires <= start_time:
             return "its expiry is at or before its start time"
-        if row["crontab_id"] or row["interval_id"]:
-            return "its schedule row is missing"
-        return "solar and clocked schedules have no equivalent"
+        # The window the call would carry, not the one beat stored. The end
+        # is a microsecond before the expiry, and without a printed start the
+        # schedule starts when it is created, after now. create_schedule
+        # refuses an end that is not after the start.
+        if start_time is not None and row["_end_time"] <= start_time:
+            return (
+                "its adjusted end_time is at or before its start time, too "
+                "short for a stored schedule"
+            )
+        if start_time is None and row["_end_time"] <= now:
+            return "its expiry is one microsecond away, too short for a stored schedule"
+        return None
+
+
+def _happens_once(wall: datetime, zone: tzinfo) -> bool:
+    """
+    Does a naive local time name exactly one instant in zone?
+
+    Where a clock change skips an hour its times never happen, and where it
+    repeats one they happen twice; fold picks between the two readings, and
+    only a time that happens once reads the same with either.
+    """
+    return (
+        wall.replace(tzinfo=zone, fold=0).utcoffset()
+        == wall.replace(tzinfo=zone, fold=1).utcoffset()
+    )
+
+
+def _non_finite(value: Any) -> bool:
+    """
+    Does decoded JSON hold NaN or an infinity anywhere? json.loads accepts
+    both, and neither has a Python literal to be printed as.
+    """
+    # Walk with an explicit stack: decoded JSON can be deep enough for
+    # a recursive non-finite check to hit Python's recursion limit.
+    pending = [value]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, float) and not math.isfinite(item):
+            return True
+        if isinstance(item, dict):
+            pending.extend(item.values())
+        elif isinstance(item, list):
+            pending.extend(item)
+    return False

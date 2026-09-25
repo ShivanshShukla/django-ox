@@ -7,12 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- Fixed a quoting bug in `ox_import_beat_schedules` output. Versions
+  1.2.0-1.4.0 did not safely quote some stored text in printed code.
+  Text in the beat table could become Python that runs when the
+  output is applied. Only projects that ran those versions of the
+  importer, applied its output and had relevant beat records someone
+  could edit are affected, for example through Django admin beat
+  permissions. Installing django-ox or running the command without
+  applying its output does not trigger the issue. Resulting Python
+  could remain in `settings.py` and run whenever settings load, with
+  each loading process's privileges, or run with the privileges of
+  the process applying generated schedule calls. Version 1.5.0
+  quotes every stored value with `ascii()`; tests cover every
+  location across SQLite, PostgreSQL and MySQL. Upgrade before
+  generating output. Regenerate saved output from affected versions
+  and review it before applying. If old output was applied, inspect
+  pasted settings code, deployed and repository copies, retained
+  schedule-call output and created schedules for unexpected Python,
+  tasks, arguments or timing. If unexpected Python is found or its
+  execution is suspected, investigate it as a security incident.
+  These checks cannot rule out prior execution; upgrading or
+  removing unexpected code does not undo it. Found during the
+  project's own review; there are no reports of this issue being used.
+
 ### Fixed
 
 - Documented the `worker_class` structured log key on
   `claim_filter_sql_missing` and added a source-to-documentation test for
   structured-log extra keys.
-- `ox_import_beat_schedules` preserves supported `start_time` and `expires` bounds when importing schedules from `django-celery-beat`. It lists one-off rows, expired rows, and expiries at or before a future start under `# Not translated, and why:`, interprets naive cursor values using `connection.timezone` when `USE_TZ=True`, and warns about expiry before application in the footer.
+- `ox_import_beat_schedules` now lists one-off, expired and
+  empty-window rows under "Not translated, and why:" instead of
+  importing them as recurring or live schedules. Supported schedules
+  retain start times only when they are later than the import instant,
+  otherwise starting when created; exclusive expiry bounds are always
+  preserved by setting `end_time` one microsecond earlier. If you
+  applied output from versions 1.2.0-1.4.0, review imported schedules
+  for unintended recurrence, missing start times and missing expiries;
+  disable or correct affected schedules. Database read errors,
+  non-null date bounds decoded as `None`, and date-bound conversion
+  failures stop the import with a concise error before any code is
+  printed. Rows with invalid JSON arguments or non-finite numeric
+  values are skipped with a reason. The application notes describe
+  naive-local date interpretation and the difference in first-run
+  behavior for tasks with a start time.
 
 ### Added
 
